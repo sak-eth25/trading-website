@@ -1,14 +1,84 @@
 const db = require('../db');
-const finnhubService = require('./finnhubService');
 const { executeBuyOrder, executeSellOrder } = require('../controllers/tradingController');
 
+// Historical replay state
+const historicalData = new Map();
+const historicalIndex = new Map();
+
 /**
- * Check pending orders and execute them if price matches limit
- * @param {object} io - Socket.io instance
+ * Load historical Yahoo Finance prices for all stocks.
+ * Uses the OHLCV data already stored in pricedata.
+ */
+async function loadHistoricalData() {
+  try {
+    const result = await db.query(`
+      SELECT
+        p.stock_id,
+        p.recorded_at,
+        p.close_price
+      FROM pricedata p
+      WHERE p.source = 'yahoo'
+        AND p.close_price IS NOT NULL
+      ORDER BY p.stock_id, p.recorded_at ASC
+    `);
+
+    historicalData.clear();
+    historicalIndex.clear();
+
+    for (const row of result.rows) {
+      if (!historicalData.has(row.stock_id)) {
+        historicalData.set(row.stock_id, []);
+        historicalIndex.set(row.stock_id, 0);
+      }
+
+      historicalData.get(row.stock_id).push({
+        recorded_at: row.recorded_at,
+        price: Number(row.close_price)
+      });
+    }
+
+    console.log('📊 Historical price data loaded:');
+
+    for (const [stockId, prices] of historicalData.entries()) {
+      console.log(`   Stock ${stockId}: ${prices.length} bars`);
+    }
+
+  } catch (err) {
+    console.error('❌ Error loading historical data:', err.message);
+  }
+}
+
+
+/**
+ * Get the next historical price for a stock.
+ */
+function getNextHistoricalPrice(stockId) {
+  const prices = historicalData.get(stockId);
+
+  if (!prices || prices.length === 0) {
+    return null;
+  }
+
+  let index = historicalIndex.get(stockId) || 0;
+
+  // Replay from the beginning again when we reach the end.
+  if (index >= prices.length) {
+    index = 0;
+  }
+
+  const data = prices[index];
+
+  historicalIndex.set(stockId, index + 1);
+
+  return data;
+}
+
+
+/**
+ * Check pending orders and execute them if price matches limit.
  */
 async function checkPendingOrders(io) {
   try {
-    // Get all pending orders
     const result = await db.query(
       `SELECT o.*, s.current_price, s.symbol
        FROM orders o
@@ -25,27 +95,38 @@ async function checkPendingOrders(io) {
 
     console.log(`🔍 Checking ${pendingOrders.length} pending orders...`);
 
-    // Check each order
     for (let order of pendingOrders) {
       try {
-        // Determine if order should execute
         let shouldExecute = false;
         let executionReason = '';
 
         if (order.type === 'BUY' && order.limit_price) {
-          // Limit buy: execute when price ≤ limit_price
+
+          // Limit buy: execute when price <= limit_price
           if (order.current_price <= order.limit_price) {
             shouldExecute = true;
             executionReason = 'Limit price reached';
           }
-        } else if (order.type === 'SELL' && order.limit_price && !order.stop_loss_price) {
-          // Limit sell: execute when price ≥ limit_price
+
+        } else if (
+          order.type === 'SELL' &&
+          order.limit_price &&
+          !order.stop_loss_price
+        ) {
+
+          // Limit sell: execute when price >= limit_price
           if (order.current_price >= order.limit_price) {
             shouldExecute = true;
             executionReason = 'Limit price reached';
           }
-        } else if (order.type === 'SELL' && order.stop_loss_price && !order.limit_price) {
-          // Stop-loss sell: execute when price ≤ stop_loss_price
+
+        } else if (
+          order.type === 'SELL' &&
+          order.stop_loss_price &&
+          !order.limit_price
+        ) {
+
+          // Stop-loss sell: execute when price <= stop_loss_price
           if (order.current_price <= order.stop_loss_price) {
             shouldExecute = true;
             executionReason = 'Stop-loss triggered';
@@ -53,15 +134,33 @@ async function checkPendingOrders(io) {
         }
 
         if (shouldExecute) {
-          console.log(`⚡ ${executionReason} - Executing ${order.type} order ${order.order_id} for ${order.symbol} at ₹${order.current_price}`);
+
+          console.log(
+            `⚡ ${executionReason} - Executing ${order.type} order ` +
+            `${order.order_id} for ${order.symbol} at ₹${order.current_price}`
+          );
 
           if (order.type === 'BUY') {
-            await executeBuyOrder(db, order.order_id, order.user_id, order.stock_id, order.quantity, order.current_price);
+            await executeBuyOrder(
+              db,
+              order.order_id,
+              order.user_id,
+              order.stock_id,
+              order.quantity,
+              order.current_price
+            );
+
           } else if (order.type === 'SELL') {
-            await executeSellOrder(db, order.order_id, order.user_id, order.stock_id, order.quantity, order.current_price);
+            await executeSellOrder(
+              db,
+              order.order_id,
+              order.user_id,
+              order.stock_id,
+              order.quantity,
+              order.current_price
+            );
           }
 
-          // Emit event to notify user
           io.emit('orderExecuted', {
             order_id: order.order_id,
             type: order.type,
@@ -72,8 +171,12 @@ async function checkPendingOrders(io) {
             timestamp: new Date()
           });
         }
+
       } catch (err) {
-        console.error(`❌ Error executing order ${order.order_id}:`, err.message);
+        console.error(
+          `❌ Error executing order ${order.order_id}:`,
+          err.message
+        );
       }
     }
 
@@ -82,17 +185,25 @@ async function checkPendingOrders(io) {
   }
 }
 
+
 /**
- * Update all stock prices from Finnhub API and emit to connected clients
- * @param {object} io - Socket.io instance
+ * Update all stock prices using historical Yahoo Finance data.
+ *
+ * Every 30 seconds the next historical 5-minute bar is replayed.
  */
 async function updateAllStocks(io) {
+
   try {
+
     const cycleStart = Date.now();
-    console.log('🔄 Starting price update cycle...');
+
+    console.log('🔄 Starting historical price replay...');
 
     // Get all stocks from database
-    const result = await db.query('SELECT stock_id, symbol FROM stocks');
+    const result = await db.query(
+      'SELECT stock_id, symbol FROM stocks'
+    );
+
     const stocks = result.rows;
 
     if (stocks.length === 0) {
@@ -100,76 +211,109 @@ async function updateAllStocks(io) {
       return;
     }
 
-    const apiStart = Date.now();
-    // Fetch prices for all stocks
-    for (let stock of stocks) {
-      try {
-        const price = await finnhubService.getStockPrice(stock.symbol);
+    // Load historical data once
+    if (historicalData.size === 0) {
+      await loadHistoricalData();
+    }
 
-        if (price === null) {
-          console.warn(`⚠️ Skipping ${stock.symbol} - no price data`);
+    for (const stock of stocks) {
+
+      try {
+
+        const historicalPrice =
+          getNextHistoricalPrice(stock.stock_id);
+
+        if (!historicalPrice) {
+
+          console.warn(
+            `⚠️ No historical price data for ${stock.symbol}`
+          );
+
           continue;
         }
 
-        // Update stocks table with new current_price
+        const price = historicalPrice.price;
+
+        // Update current simulated market price
         await db.query(
-          'UPDATE stocks SET current_price = $1, last_updated = CURRENT_TIMESTAMP WHERE stock_id = $2',
+          `UPDATE stocks
+           SET current_price = $1,
+               last_updated = CURRENT_TIMESTAMP
+           WHERE stock_id = $2`,
           [price, stock.stock_id]
         );
 
-        // Insert into pricedata table for history/charts
-        await db.query(
-          'INSERT INTO pricedata (stock_id, price) VALUES ($1, $2)',
-          [stock.stock_id, price]
+        console.log(
+          `📈 ${stock.symbol}: ₹${price} ` +
+          `(historical: ${historicalPrice.recorded_at})`
         );
 
-        console.log(`✅ Updated ${stock.symbol}: $${price}`);
-
-        // Emit to all connected clients
+        // Send price to frontend
         io.emit('priceUpdate', {
           stock_id: stock.stock_id,
           symbol: stock.symbol,
           price: price,
-          timestamp: new Date()
+          timestamp: new Date(),
+          historical_timestamp: historicalPrice.recorded_at
         });
 
       } catch (err) {
-        console.error(`❌ Error updating ${stock.symbol}:`, err.message);
+
+        console.error(
+          `❌ Error updating ${stock.symbol}:`,
+          err.message
+        );
       }
     }
-    const apiTime = Date.now() - apiStart;
-    console.log(`⏱️ API + DB updates: ${apiTime}ms`);
 
-    // After updating all prices, check pending orders
-    const orderStart = Date.now();
+    // Keep existing order execution logic
     await checkPendingOrders(io);
-    const orderTime = Date.now() - orderStart;
-    console.log(`⏱️ Order checking: ${orderTime}ms`);
 
     const totalTime = Date.now() - cycleStart;
-    console.log(`✅ Price update cycle completed in ${totalTime}ms\n`);
+
+    console.log(
+      `✅ Historical replay cycle completed in ${totalTime}ms\n`
+    );
 
   } catch (err) {
-    console.error('❌ Error in updateAllStocks:', err.message);
+
+    console.error(
+      '❌ Error in updateAllStocks:',
+      err.message
+    );
   }
 }
 
+
 /**
- * Start the price updater service with interval scheduling
- * Updates prices every 30 seconds and checks pending orders
- * More reliable than cron for frequent tasks
- * @param {object} io - Socket.io instance
+ * Start historical price replay.
+ *
+ * Every 30 seconds the next historical bar is replayed.
  */
 function startPriceUpdater(io) {
-  // Schedule: Every 30 seconds using setInterval (30,000ms)
-  setInterval(() => {
+
+  // Load historical data first
+  loadHistoricalData().then(() => {
+
+    console.log(
+      '✅ Historical price replay started'
+    );
+
+    console.log(
+      '⏱️ Advancing one historical 5-minute bar every 30 seconds'
+    );
+
+    // First update immediately
     updateAllStocks(io);
-  }, 30000);
 
-  console.log('✅ Price updater service started (updates every 30 seconds)');
+    // Continue every 30 seconds
+    setInterval(() => {
+      updateAllStocks(io);
+    }, 30000);
 
-  // Also run once immediately when service starts
-  updateAllStocks(io);
+  });
+
 }
+
 
 module.exports = startPriceUpdater;
